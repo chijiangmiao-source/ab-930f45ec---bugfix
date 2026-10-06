@@ -108,6 +108,10 @@ def make_handler(store: DecisionStore) -> type[BaseHTTPRequestHandler]:
                     },
                 )
                 return
+            except Exception as exc:  # noqa: BLE001
+                # 裁决计算异常：存储层已释放在途占位，同标识可安全重试。
+                self._error(500, "ADJUDICATION_FAILED", f"裁决计算失败: {exc}")
+                return
             self._json(
                 {"ok": True, "created": created, **decision.to_json()},
                 201 if created else 200,

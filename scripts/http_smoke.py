@@ -14,7 +14,9 @@
 3. 幂等冻结：相同内容重复提交/读取返回同一 content_hash；
 4. 冲突：同一审计标识不同内容 -> 409 且原裁决不变；
 5. 队列增长拒绝：提交不可收敛场景，校验 NON_CONVERGENT 与连续增长链；
-6. 输入校验失败返回 400。
+6. 输入校验失败返回 400；
+7. 并发等价提交：同一审计标识的并发相同请求仅一次创建，
+   全部响应的哈希、冻结时间与冻结结论完全一致。
 任一断言失败以非零退出码退出。
 """
 
@@ -25,6 +27,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -179,6 +182,36 @@ def run_smoke(base: str) -> None:
           and isinstance(body7, dict) and body7.get("error") == "VALIDATION_FAILED")
     status, body8 = request("GET", base + "/api/decisions/NO-SUCH-ID")
     check("读取不存在裁决 -> 404", status == 404)
+
+    print("[7] 并发等价提交：同一标识任一时刻仅一份冻结结论")
+    burst = json.loads(json.dumps(CARRYOVER))
+    burst["audit_id"] = "SMK-CONC-001"
+    responses: list = []
+
+    def _submit() -> None:
+        responses.append(request("POST", base + "/api/submit", burst))
+
+    threads = [threading.Thread(target=_submit) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    created = [b for s, b in responses if s == 201]
+    replayed = [b for s, b in responses if s == 200]
+    check("并发等价提交恰好一次创建、其余回放",
+          len(responses) == 6 and len(created) == 1 and len(replayed) == 5,
+          str([s for s, _ in responses]))
+    hashes = {b["content_hash"] for _, b in responses}
+    frozen_ats = {b["frozen_at"] for _, b in responses}
+    decisions = {json.dumps(b["decision"], sort_keys=True) for _, b in responses}
+    check("并发响应哈希完全一致", len(hashes) == 1, str(hashes))
+    check("并发响应冻结时间完全一致", len(frozen_ats) == 1, str(frozen_ats))
+    check("并发响应冻结结论完全一致", len(decisions) == 1)
+    status, body9 = request("GET", base + "/api/decisions/SMK-CONC-001")
+    check("读取与并发冻结结果一致",
+          status == 200 and isinstance(body9, dict)
+          and hashes == {body9["content_hash"]}
+          and frozen_ats == {body9["frozen_at"]})
 
 
 def main() -> int:
