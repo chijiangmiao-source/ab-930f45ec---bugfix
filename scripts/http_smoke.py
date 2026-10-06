@@ -12,9 +12,10 @@
 2. 跨周期遗留帧最终收敛：提交可调度场景，读取冻结裁决，
    校验 SCHEDULABLE、逐时隙证据与遗留边界样本（t=1000 时遗留 1 帧、超周期排空）；
 3. 幂等冻结：相同内容重复提交/读取返回同一 content_hash；
-4. 冲突：同一审计标识不同内容 -> 409 且原裁决不变；
-5. 队列增长拒绝：提交不可收敛场景，校验 NON_CONVERGENT 与连续增长链；
-6. 输入校验失败返回 400。
+4. 并发等价提交：恰一次 201 新建，其余回放，哈希/冻结时间/结论完全一致；
+5. 冲突：同一审计标识不同内容 -> 409 且原裁决不变；
+6. 队列增长拒绝：提交不可收敛场景，校验 NON_CONVERGENT 与连续增长链；
+7. 输入校验失败返回 400。
 任一断言失败以非零退出码退出。
 """
 
@@ -28,6 +29,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -143,7 +145,30 @@ def run_smoke(base: str) -> None:
     check("读取结论与提交一致",
           body3["decision"]["verdict"] == "SCHEDULABLE")
 
-    print("[4] 同标识不同内容 -> 409 冲突且原裁决不变")
+    print("[4] 并发等价提交仅一次创建、哈希与冻结结论一致")
+    burst = dict(CARRYOVER, audit_id="SMK-BURST-001")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        burst_results = list(pool.map(
+            lambda _: request("POST", base + "/api/submit", burst), range(4)))
+    burst_statuses = [s for s, _ in burst_results]
+    check("并发等价提交恰有一次 201 新建",
+          burst_statuses.count(201) == 1 and burst_statuses.count(200) == 3,
+          str(burst_statuses))
+    burst_bodies = [b for _, b in burst_results]
+    check("并发响应创建标记恰一个 true",
+          sum(1 for b in burst_bodies if b.get("created")) == 1)
+    check("并发响应哈希一致",
+          len({b["content_hash"] for b in burst_bodies}) == 1)
+    check("并发响应冻结时间一致（同一份结论）",
+          len({b["frozen_at"] for b in burst_bodies}) == 1)
+    check("并发响应冻结结论一致",
+          len({json.dumps(b["decision"], sort_keys=True) for b in burst_bodies}) == 1)
+    status, burst_read = request("GET", base + "/api/decisions/SMK-BURST-001")
+    check("读取并发冻结结论与提交一致",
+          status == 200 and isinstance(burst_read, dict)
+          and burst_read["content_hash"] == burst_bodies[0]["content_hash"])
+
+    print("[5] 同标识不同内容 -> 409 冲突且原裁决不变")
     changed = json.loads(json.dumps(CARRYOVER))
     changed["flows"][1]["transmit_time"] = 401
     status, body4 = request("POST", base + "/api/submit", changed)
@@ -157,7 +182,7 @@ def run_smoke(base: str) -> None:
           and body5["decision"]["verdict"] == "SCHEDULABLE"
           and body5["request"]["flows"][1]["transmit_time"] == 400)
 
-    print("[5] 队列增长拒绝（NON_CONVERGENT，不截断判通过）")
+    print("[6] 队列增长拒绝（NON_CONVERGENT，不截断判通过）")
     status, body6 = request("POST", base + "/api/submit", GROWTH)
     check("提交不可收敛场景 -> 201", status == 201, str(body6))
     d6 = body6["decision"]
@@ -170,7 +195,7 @@ def run_smoke(base: str) -> None:
                for seg in d6["timeline"])
     check("时间线证明新帧不覆盖旧帧（FLOOD#0、FLOOD#1 共存）", fifo)
 
-    print("[6] 非法输入 -> 400")
+    print("[7] 非法输入 -> 400")
     bad = json.loads(json.dumps(CARRYOVER))
     bad["audit_id"] = "SMK-BAD-001"
     bad["gate_entries"] = [{"start": 900, "end": 100, "priorities": [0]}]

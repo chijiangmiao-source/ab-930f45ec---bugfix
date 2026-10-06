@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -106,6 +107,15 @@ def make_handler(store: DecisionStore) -> type[BaseHTTPRequestHandler]:
                         # 原冻结裁决保持不变并随冲突响应回显。
                         "existing_decision": existing.to_json() if existing else None,
                     },
+                )
+                return
+            except Exception:
+                # 裁决计算异常：存储层已释放该标识，不占用、可重试。
+                traceback.print_exc()
+                self._error(
+                    500,
+                    "ADJUDICATION_FAILED",
+                    "裁决计算失败，审计标识未被占用，可重试",
                 )
                 return
             self._json(
